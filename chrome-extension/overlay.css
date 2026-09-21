@@ -1,0 +1,110 @@
+/* macdm IDM-style video overlay — prefixed classes + all:initial/unset so
+   site CSS can't bleed in and the widget can't leak styles back out. */
+
+.macdm-ov {
+  all: initial;
+  position: fixed;
+  z-index: 2147483647;
+  transform: translateX(-100%); /* anchor right edge at the styled left/top */
+  display: block;
+  direction: ltr;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  font-size: 13px;
+  line-height: 1;
+  color: #fff;
+}
+
+.macdm-bar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.macdm-pill {
+  all: unset;
+  box-sizing: border-box;
+  display: inline-flex;
+  align-items: center;
+  padding: 8px 14px;
+  border-radius: 999px;
+  background: linear-gradient(135deg, #0a84ff, #5e5ce6);
+  color: #fff;
+  font-family: inherit;
+  font-size: 13px;
+  font-weight: 600;
+  white-space: nowrap;
+  cursor: pointer;
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.35);
+}
+
+.macdm-pill:hover { filter: brightness(1.12); }
+.macdm-pill.macdm-busy { opacity: 0.75; cursor: default; }
+.macdm-pill.macdm-ok { background: #30d158; }
+.macdm-pill.macdm-err { background: #ff453a; }
+
+.macdm-close {
+  all: unset;
+  box-sizing: border-box;
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  background: rgba(28, 28, 30, 0.85);
+  color: #fff;
+  font-family: inherit;
+  font-size: 15px;
+  line-height: 1;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+}
+
+.macdm-close:hover { background: rgb(28, 28, 30); }
+
+.macdm-menu {
+  display: none;
+  margin-top: 6px;
+  padding: 6px;
+  border-radius: 12px;
+  background: rgba(28, 28, 30, 0.96);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
+  max-width: 320px;
+}
+
+.macdm-menu.macdm-open { display: block; }
+
+.macdm-row {
+  all: unset;
+  box-sizing: border-box;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  width: 100%;
+  padding: 8px 10px;
+  border-radius: 8px;
+  color: #fff;
+  font-family: inherit;
+  font-size: 12.5px;
+  cursor: pointer;
+}
+
+.macdm-row:hover { background: rgba(10, 132, 255, 0.35); }
+
+.macdm-row span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.macdm-row em {
+  flex: none;
+  font-style: normal;
+  font-size: 10.5px;
+  font-weight: 700;
+  letter-spacing: 0.4px;
+  color: #0a84ff;
+  background: rgba(10, 132, 255, 0.15);
+  padding: 3px 6px;
+  border-radius: 999px;
+}

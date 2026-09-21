@@ -1,0 +1,37 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <style>
+    body { width: 360px; font: 13px -apple-system, system-ui, sans-serif; margin: 10px; }
+    h3 { margin: 4px 0 10px; display: flex; align-items: center; gap: 6px; }
+    .url { display: flex; gap: 6px; }
+    input { flex: 1; padding: 5px 7px; border: 1px solid #ccc; border-radius: 6px; }
+    button { padding: 5px 10px; border: none; border-radius: 6px; background: #0a84ff; color: #fff; cursor: pointer; }
+    ul { list-style: none; padding: 0; margin: 10px 0 0; max-height: 300px; overflow-y: auto; }
+    li { display: flex; align-items: center; justify-content: space-between; gap: 8px;
+         padding: 6px 8px; border-radius: 8px; }
+    li:hover { background: #f0f0f0; }
+    .entry { display: flex; align-items: baseline; gap: 8px; min-width: 0; }
+    .name { color: #1d1d1f; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .quality { font-size: 11px; color: #fff; background: #0a84ff; border-radius: 5px; padding: 1px 6px; white-space: nowrap; }
+    li button { background: #e5e5e5; color: #000; }
+    #status { margin-top: 8px; color: #666; min-height: 16px; font-size: 12px; }
+    .err { color: #d00 !important; }
+  </style>
+</head>
+<body>
+  <h3><img src="icon.png" width="20" height="20"> macdm</h3>
+  <div class="url">
+    <input id="url" placeholder="Paste a URL…">
+    <button id="add">Download</button>
+  </div>
+  <label style="display:flex;align-items:center;gap:6px;margin-top:10px;font-size:12px">
+    <input type="checkbox" id="intercept" style="margin:0">
+    Send Chrome downloads of supported files to macdm
+  </label>
+  <ul id="found"></ul>
+  <div id="status"></div>
+  <script src="popup.js"></script>
+</body>
+</html>
