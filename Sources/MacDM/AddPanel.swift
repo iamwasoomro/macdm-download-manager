@@ -168,13 +168,15 @@ final class AddPanelControllerImpl: NSObject {
             return
         }
         let height = qualityPopup?.selectedItem?.representedObject as? Int
-        manager.add(url: text, maxHeight: height, startNow: startNow)
+        guard let added = manager.add(url: text, maxHeight: height, startNow: startNow) else {
+            let alert = NSAlert(); alert.messageText = "Enter a valid HTTP/HTTPS link that isn’t already in the list."
+            if let panel { alert.beginSheetModal(for: panel) }
+            return
+        }
         // Manual category override if the user chose one
         if let idx = categoryPopup?.indexOfSelectedItem, idx > 0 {
             let cat = DownloadCategory.allCases[idx - 1]
-            if let item = manager.items.first(where: { $0.url == text || "https://" + text == $0.url }) {
-                item.category = cat
-            }
+            added.category = cat
         }
         manager.onChange?()
         close()

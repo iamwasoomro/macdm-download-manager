@@ -52,7 +52,9 @@ enum DownloadIntake {
         }
 
         let est = await estimate(url: url, maxHeight: maxHeight,
-                                 cookies: incoming.cookies, userAgent: incoming.userAgent)
+                                 cookies: incoming.cookies, userAgent: incoming.userAgent,
+                                 filename: incoming.filename, mime: incoming.mimeType,
+                                 forceVideo: incoming.forceVideo)
 
         NSApp.activate(ignoringOtherApps: true)
         window?.makeKeyAndOrderFront(nil)
@@ -74,11 +76,13 @@ enum DownloadIntake {
         case .alertFirstButtonReturn:
             manager.add(url: url, maxHeight: maxHeight, referrer: referrer,
                         cookies: incoming.cookies, userAgent: incoming.userAgent,
-                        startNow: true)?.estimatedSize = est.size
+                        startNow: true, filename: incoming.filename,
+                        mime: incoming.mimeType, forceVideo: incoming.forceVideo)?.estimatedSize = est.size
         case .alertSecondButtonReturn:
             manager.add(url: url, maxHeight: maxHeight, referrer: referrer,
                         cookies: incoming.cookies, userAgent: incoming.userAgent,
-                        startNow: false)?.estimatedSize = est.size
+                        startNow: false, filename: incoming.filename,
+                        mime: incoming.mimeType, forceVideo: incoming.forceVideo)?.estimatedSize = est.size
         default:
             break
         }
@@ -165,12 +169,15 @@ enum DownloadIntake {
     // MARK: - Estimation
 
     static func estimate(url urlString: String, maxHeight: Int?,
-                         cookies: String? = nil, userAgent: String? = nil) async -> Estimate {
-        // Video sites AND raw HLS/DASH playlists: metadata comes from yt-dlp
-        // (a HEAD on a playlist would measure the playlist text, not the video)
-        if VideoDetector.isSupportedSite(urlString) || VideoDetector.isStreamURL(urlString),
+                         cookies: String? = nil, userAgent: String? = nil,
+                         filename: String? = nil, mime: String? = nil,
+                         forceVideo: Bool = false) async -> Estimate {
+        // Video sites, raw HLS/DASH playlists, and links the extension marked
+        // as video intent: metadata comes from yt-dlp (a HEAD on a playlist
+        // would measure the playlist text, not the video)
+        if forceVideo || VideoDetector.isSupportedSite(urlString) || VideoDetector.isStreamURL(urlString),
            let info = try? await VideoDetector.fetchInfo(url: urlString, cookies: cookies, userAgent: userAgent) {
-            let title = info.title ?? URL(string: urlString)?.lastPathComponent ?? "video"
+            let title = info.title ?? filename ?? URL(string: urlString)?.lastPathComponent ?? "video"
             let cat: DownloadCategory = (info.duration ?? 0) < 600
                 && (info.extractor ?? "").lowercased().contains("soundcloud") ? .music : .videos
             return Estimate(name: title,
@@ -187,16 +194,21 @@ enum DownloadIntake {
             if let (_, resp) = try? await URLSession.shared.data(for: req),
                let http = resp as? HTTPURLResponse, (200..<300).contains(http.statusCode) {
                 let length = http.value(forHTTPHeaderField: "Content-Length").flatMap(Int64.init) ?? -1
-                let name = http.suggestedFilename ?? url.lastPathComponent
-                let cat = DownloadCategory.detect(url: urlString,
-                    mimeType: http.value(forHTTPHeaderField: "Content-Type"))
+                let name = http.suggestedFilename ?? filename ?? url.lastPathComponent
+                let cat: DownloadCategory = forceVideo
+                    ? .videos
+                    : DownloadCategory.detect(url: urlString,
+                        mimeType: http.value(forHTTPHeaderField: "Content-Type") ?? mime,
+                        filename: filename)
                 return Estimate(name: name, size: length,
                                 path: DownloadItem.destinationFolder(for: cat).path)
             }
         }
 
-        let cat = DownloadCategory.detect(url: urlString)
-        let name = URL(string: urlString)?.lastPathComponent ?? urlString
+        let cat: DownloadCategory = forceVideo
+            ? .videos
+            : DownloadCategory.detect(url: urlString, mimeType: mime, filename: filename)
+        let name = filename ?? URL(string: urlString)?.lastPathComponent ?? urlString
         return Estimate(name: name, size: -1,
                         path: DownloadItem.destinationFolder(for: cat).path)
     }

@@ -6,14 +6,15 @@ const status = (msg, err = false) => {
 
 let pageUrl = null; // current tab URL, sent as the download's referrer
 
-async function addURL(url, maxHeight) {
+async function addURL(url, maxHeight, video) {
   if (!url) return;
-  const res = await chrome.runtime.sendMessage({ type: "macdm-add", url, maxHeight, referrer: pageUrl });
-  status(res?.ok ? "Sent to macdm ✓" : "macdm app is not running (open MacDM first)", !res?.ok);
+  const res = await chrome.runtime.sendMessage({ type: "macdm-add", url, maxHeight, referrer: pageUrl, video: video !== false });
+  status(res?.ok ? "Sent to macdm ✓" : "MacDM is not available. Open the app and try again.", !res?.ok);
 }
 
-$("add").onclick = () => addURL($("url").value.trim());
-$("url").addEventListener("keydown", e => { if (e.key === "Enter") addURL(e.target.value.trim()); });
+// detected rows are always video intent; the manual URL field is not
+$("add").onclick = () => addURL($("url").value.trim(), null, false);
+$("url").addEventListener("keydown", e => { if (e.key === "Enter") addURL(e.target.value.trim(), null, false); });
 // a different URL invalidates the detected list — don't leave stale entries
 $("url").addEventListener("input", e => {
   if (e.target.value.trim() !== pageUrl) {
@@ -30,7 +31,8 @@ function qualityLabel(h) {
 }
 
 function shortName(name, max = 46) {
-  const clean = decodeURIComponent(name || "").split("?")[0];
+  let clean = (name || "").split("?")[0];
+  try { clean = decodeURIComponent(clean); } catch {}
   return clean.length > max ? clean.slice(0, max - 1) + "…" : clean;
 }
 
@@ -48,7 +50,8 @@ function row(url, name, quality, maxHeight, referrer) {
   label.append(title, q);
   const btn = document.createElement("button");
   btn.textContent = "Download";
-  btn.onclick = e => { e.preventDefault(); addURL(url, maxHeight ?? null, referrer ?? pageUrl); };
+  // every listed row is a video/stream/page link — flag video intent
+  btn.onclick = e => { e.preventDefault(); addURL(url, maxHeight ?? null, true); };
   li.append(label, btn);
   return li;
 }

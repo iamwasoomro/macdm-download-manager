@@ -8,16 +8,34 @@ import AppKit
 @MainActor
 enum Snapshotter {
 
-    static func runIfNeeded(window: NSWindow, manager: DownloadManager) {
+    static func runIfNeeded(window: NSWindow, manager: DownloadManager,
+                            videoPanel: VideoPanelController? = nil) {
         let args = CommandLine.arguments
         if args.contains("--demo") {
             DemoContent.inject(into: manager)
+        }
+        if args.contains("--video-panel"), let videoPanel {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) {
+                videoPanel.present(on: window)
+                videoPanel.urlField?.stringValue = "https://youtu.be/aqz-KE-bpKQ"
+            }
+        }
+        var preview: FormPanel?
+        if args.contains("--settings-panel") { preview = SettingsPanel(manager: manager) }
+        if args.contains("--media-options-panel") { preview = MediaOptionsPanel(manager: manager) }
+        if args.contains("--batch-panel") { preview = BatchPanel(manager: manager) }
+        if args.contains("--schedule-panel") { preview = QueueSchedulePanel(manager: manager) }
+        if let preview {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { preview.present(on: window) }
         }
         guard let i = args.firstIndex(of: "--snapshot"), args.indices.contains(i + 1) else { return }
         let path = args[i + 1]
         // let the window, effect views and table settle before capturing
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.6) {
-            capture(window: window, to: path)
+            // a sheet is its own CGWindow — when it's the subject, capture it
+            let target = preview?.panel ?? videoPanel?.panel ?? window
+            capture(window: target, to: path)
+            if let parent = target.sheetParent { parent.endSheet(target); target.orderOut(nil) }
             NSApp.terminate(nil)
         }
     }

@@ -348,6 +348,82 @@ Located at `/Users/wasoomro/Desktop/mac-dm/`.
   default "Field" column header — `tableView.headerView = nil` now, same as
   the sidebar outline.
 
+## v0.19.1 — X/Twitter "Could not authenticate you" fix
+- **Bug**: downloading a quality from an x.com post failed (e.g. 360p on
+  x.com/CopilotKit/status/…). Root cause: the extension forwards the page's
+  browser cookies and `VideoDetector.headerArgs` force-attached them with
+  `--add-headers "Cookie: …"`. X's API is CSRF-sensitive — a forced ct0/auth
+  cookie pair poisons yt-dlp's own guest-token flow →
+  `ERROR: [twitter] … Could not authenticate you` (reproduced locally with a
+  fake cookie; the same URL downloads fine with no Cookie header).
+- **Fix**: fetchInfo() and download() now try WITH forwarded cookies first
+  (login walls need them — YouTube/Rumble unaffected) and on failure retry
+  ONCE without the Cookie header (UA kept). Verified via the live server:
+  POST /info with fake cookies previously 502'd, now returns title + heights
+  [1080, 720, 360, 270] via the fallback.
+- **Diagnosability**: yt-dlp stderr was discarded (errors showed as "yt-dlp
+  exited with status N"). Both run() and download() now capture stderr and
+  surface the actual ERROR lines (≤300 chars) on the failed download card.
+  /info per-attempt timeout 12s → 20s to fit the fallback's second run.
+
+## v0.20 — double-click opens finished downloads
+- Double-clicking a completed card opens the file with its default app
+  (`NSWorkspace.shared.open`) via the table's `doubleAction`. Non-completed
+  rows ignore double-clicks (buttons/menu still handle stop/retry/delete).
+- **`DownloadItem.fileURL`** (new): resolves the file actually on disk —
+  yt-dlp items live under `resolvedFilename` ("Title (360p).mp4") while
+  `filename` is the bare title, so `destination` missed the real file.
+  Resolution order: resolved name if it exists → destination if it exists →
+  prefix match in the category folder. `revealInFinder` and the completed
+  delete flow now trash/reveal the REAL file through it (previously reveal
+  could select a nonexistent extension-less path for yt-dlp items).
+
+## v0.21 — Add Video button
+- **"Add Video" button next to Add Link** in the content header row (the
+  NSToolbar never actually rendered its items — the transparent full-size-
+  content-view titlebar hides it; the visible button was always the in-content
+  header one, so the new button went there too. Toolbar wiring kept anyway).
+- **VideoPanel.swift** (`VideoPanelController`): sheet with URL field →
+  "Get Video" → **loader state** ("Checking link — resolving video…") →
+  **results state**: 🎬 title, Quality popup (Best / 4K / 1440p / 1080p …
+  from yt-dlp heights) with live ≈size estimate, Start Download.
+  - Link classification: HLS/DASH stream → video (metadata optional);
+    direct media (HEAD probe) → video, original quality; otherwise yt-dlp
+    -J must return at least one video stream (vcodec ≠ none) or it's
+    rejected with a warning dialog carrying the yt-dlp error ("This link
+    isn't a video"). Sheet returns to the input state for correction.
+  - Download semantics per spec: item forced into **Videos** category,
+    **referrer = the given link**, and `DownloadItem.forceVideo` (new) makes
+    DownloadManager.run route page-style links through yt-dlp even on
+    unknown hosts (previously they went to the segmented downloader and
+    would just save HTML).
+- Snapshot tooling: `--video-panel` pre-opens the sheet (prefilled URL) for
+  captures; sheet captures target the sheet's own CGWindow (a sheet is a
+  separate window, the parent-window capture excluded it).
+- Debugging lesson (repeated 2×): `swiftc | grep error | head -N` hides real
+  compile errors behind the concurrency warnings that contain the word
+  "error" — grep for "error:" and check the binary (strings) before testing.
+
+## v0.22 — archive categorization hardening (Compressed)
+- The Compressed category existed since v0.14 but only matched URLs carrying
+  a file extension — an archive from an extension-less URL
+  (example.com/get/12345) landed in Other even though Chrome knew it was
+  "archive.rar" from Content-Disposition.
+- **Extension → app filename forwarding**: downloads.onCreated interception
+  now sends `filename` (Chrome's resolved save name) and `mime` in /add;
+  IncomingDownload carries them; manager.add re-detects the category with
+  them and, when the URL has no extension, pre-sets resolvedFilename so the
+  file saves under its proper name. DownloadIntake.estimate uses them too.
+- **Detection order** (DownloadCategory.detect): filename ext → URL ext →
+  MIME → video-site host → Other. MIME now outranks the host guess (a zip
+  served from x.com is Compressed, not Videos).
+- **Mid-flight refinement**: SegmentedDownloader re-detects from the
+  Content-Disposition name when the item defaulted to Other (probe-time
+  category fix for manual/add-sheet URLs).
+- Compressed set extended: + tbz2, txz, lz4, lzma, cab, lzh, arj (both app
+  and extension FILE_EXTENSIONS). Verified via a standalone 15-case test
+  harness (Models+VideoDetector compiled with a main.swift) — ALL PASS.
+
 ## Known gaps / next steps
 1. Load + test the Chrome extension in Chrome (permissions already include
    `host_permissions` for 127.0.0.1:7210; service worker uses fetch POST).
@@ -367,3 +443,31 @@ Located at `/Users/wasoomro/Desktop/mac-dm/`.
    localhost but a local token check would harden it.
 8. UI testing was headless-ish (app launched in background); a human should
    eyeball the window once.
+
+## Reliability and detection audit — 2026-10-09
+- Added atomic JSON download history in Application Support/MacDM; active transfers restore paused, IDs and destination names survive relaunch, cookies are excluded. History saves on list changes, every five seconds, and at termination; demo mode skips persistence.
+- Fixed unknown-size completion, final single-stream byte accounting, tiny-file segment ranges, strict Content-Range validation, HEAD 405/501 fallback, bounded-memory assembly, file-handle cleanup, and Referer forwarding.
+- HTTP transfers now publish completed files from temporary storage and preserve existing files using numbered names. Partial ranges are reused only when source URL, length, and server validator match.
+- Fixed completed-file deletion state check, kept cancelled tasks in concurrency accounting until they exit, guarded cancelled video work against late state changes, and terminate yt-dlp on task cancellation.
+- Retained toolbar delegate to keep Add buttons alive; removed ambiguous filename prefix lookup for reveal/delete.
+- Extension scans all frames and open shadow roots, deduplicates media, prefers currentSrc, tolerates malformed filename escaping, includes direct Open Graph media, detects extensionless HLS/DASH by response MIME, clears capture on navigation, and rescans on popup open.
+- Validation: native swiftc build passed (module cache at /tmp/macdm-module-cache), JavaScript syntax checks and Tests/detection.test.cjs passed, Tests/run-transfers.sh passed byte-integrity cases for tiny/ranged/unknown-size/HEAD-rejected responses, rejected ignored ranges safely, verified filename collisions and history round-trip/cookie exclusion.
+- Built MacDM and bundled executable updated. Reload unpacked Chrome extension and relaunch app to use changes. Real-site browser smoke testing remains outstanding; existing Swift concurrency warnings remain.
+
+## Modern download-manager feature pass — 2026-10-09
+- Added persistent settings for destination root, concurrent files, per-file connections, retry count, global bandwidth, notifications, and idle-sleep prevention. Existing items pin their destination and connection layout.
+- Added FIFO queue controls, move earlier/later/prioritize, pause/resume all and selected items, removal of selected history, search, state filters, sorting, aggregate speed, ETA, failure details, and preserved table selection during progress refresh.
+- Added batch clipboard intake (HTTP links only), UTF-8 text import, drag/drop URLs, native menu shortcuts, and explicit invalid/duplicate intake feedback.
+- Added queue start/stop and per-item schedules; schedules persist and require the app running and Mac awake. Queue start holds new transfers; pause cancels an item's individual schedule.
+- Added bounded whole-download backoff, network path recovery, durable partial HTTP storage, validated single-stream resume, If-Range handling, safe fallback from ignored Range requests, bounded-memory assembly, serialized collision-safe publishing, and per-file/global HTTP pacing. yt-dlp receives conservative slot-based rate caps; running video cap changes apply after resume.
+- Added video Source/MP4/MKV/WebM/M4A/MP3, audio-only mode, English subtitles when available, playlist lookup and individual item selection (up to 500), strict height caps, actual-height reporting, binary discovery, robust pipe framing/draining, and cancellation-aware metadata/media processes.
+- Added optional SHA-256 verification after transfer plus calculation/comparison from completed-file context menus; mismatch retains the file for inspection. Added native completion/failure notifications and IOKit idle-sleep assertions.
+- Hardened browser IPC: explicit IPv4 loopback socket, one-time pairing token, exact extension-origin validation, strict routes/methods, request size/time/connection limits, malformed/duplicate header rejection, URL and forwarded-header validation, safe JSON, partial-send handling, and account-aware metadata cache keys. Chrome popup exposes pairing; existing installs must pair once after reload.
+- Fixed video partial cleanup to match the item's unique filename marker rather than shared title prefixes. Cancelling Remove confirmation no longer stops the transfer.
+- Verification: warning-free native build; JS syntax and detection tests; local HTTP transfer/integrity/retry/resume/pacing/schedule/history tests; isolated bridge auth/origin/request tests; fake yt-dlp option/output/cancellation tests. Visually inspected native main, Settings, Media/Playlist, Batch, and Schedule sheets. Real-site downloads and OS notification permission interaction were not exercised in this pass.
+- Updated README with feature controls, settings behavior, pairing instructions, test commands, and practical limits. Rebuilt standalone and bundled app executables. Relaunch app and reload/pair Chrome extension to activate.
+
+## Seamless browser connection — 2026-10-09
+- Removed pairing tokens, token headers, and pairing UI from native Settings and Chrome popup at the user's request.
+- Extension connects automatically when MacDM runs. Preserved explicit loopback binding, extension-origin checks, strict JSON validation, limits, and timeouts; originless local clients also work.
+- Updated documentation and bridge regression tests. Warning-free native build, seamless bridge tests, JavaScript syntax/detection tests, and diff whitespace checks passed. Rebuilt both app executables.

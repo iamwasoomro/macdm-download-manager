@@ -56,7 +56,7 @@ final class CategorySidebar: NSObject, NSOutlineViewDataSource, NSOutlineViewDel
         outlineView.headerView = nil
         outlineView.dataSource = self
         outlineView.delegate = self
-        outlineView.selectionHighlightStyle = .sourceList
+        outlineView.style = .sourceList
         outlineView.rowHeight = 34
         let col = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("cat"))
         col.resizingMask = .autoresizingMask
@@ -135,12 +135,21 @@ final class DownloadsContentController: NSObject {
     private(set) var manager: DownloadManager!
     /// Fired when the user clicks an in-content "add" affordance.
     var onAdd: (() -> Void)?
+    var onAddVideo: (() -> Void)?
     private var category: DownloadCategory?
     private var tableView = NSTableView()
     private var emptyView = NSView()
     private var headerField = NSTextField(labelWithString: "All Downloads")
     private var subheaderField = NSTextField(labelWithString: "")
     private var observed: [UUID: AnyCancellable] = [:]
+    private let search = NSSearchField()
+    private let statusFilter = NSPopUpButton()
+    private let sortPicker = NSPopUpButton()
+    private var controlPanel: FormPanel?
+    private var menuItemID: UUID?
+    private var menuSelection: [UUID] = []
+    private var displayedIDs: [UUID] = []
+
 
     init(manager: DownloadManager) {
         self.manager = manager
@@ -150,7 +159,19 @@ final class DownloadsContentController: NSObject {
     }
 
     private var items: [DownloadItem] {
-        category.map { c in manager.items.filter { $0.category == c } } ?? manager.items
+        var list = category.map { c in manager.items.filter { $0.category == c } } ?? manager.items
+        let query = search.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !query.isEmpty { list = list.filter { $0.displayTitle.localizedCaseInsensitiveContains(query) || $0.url.localizedCaseInsensitiveContains(query) } }
+        let states: [[DownloadState]] = [[], [.fetching, .downloading], [.queued], [.paused], [.failed], [.completed], [.cancelled]]
+        let index = statusFilter.indexOfSelectedItem
+        if index > 0, index < states.count { list = list.filter { states[index].contains($0.state) } }
+        switch sortPicker.indexOfSelectedItem {
+        case 1: list.sort { $0.addedAt > $1.addedAt }
+        case 2: list.sort { $0.filename.localizedStandardCompare($1.filename) == .orderedAscending }
+        case 3: list.sort { $0.totalBytes > $1.totalBytes }
+        default: break
+        }
+        return list
     }
 
     func show(category: DownloadCategory?) {
@@ -162,10 +183,6 @@ final class DownloadsContentController: NSObject {
     /// file from disk" checkbox; incomplete/failed items get a confirmation
     /// that also clears temporary files.
     func requestDelete(_ item: DownloadItem) {
-        if item.state == .downloading || item.state == .fetching {
-            manager.cancel(item)
-        }
-
         let alert = NSAlert()
         alert.alertStyle = .warning
         alert.messageText = "Remove \"\(item.filename)\"?"
@@ -193,15 +210,21 @@ final class DownloadsContentController: NSObject {
     func reload() {
         observeItems()
         headerField.stringValue = category?.folderName ?? "All Downloads"
+        let selected = Set(tableView.selectedRowIndexes.compactMap { displayedIDs[safe: $0] })
         let list = items
         let active = list.filter { $0.state == .downloading || $0.state == .fetching }.count
-        subheaderField.stringValue = list.isEmpty ? "" : "\(list.count) \(itemS(list.count)) · \(active) active"
+        let speed = ByteCountFormatter.string(fromByteCount: Int64(manager.aggregateSpeed), countStyle: .file)
+        subheaderField.stringValue = "\(list.count) \(itemS(list.count)) · \(active) active · \(speed)/s"
+        displayedIDs = list.map { $0.id }
         tableView.reloadData()
+        tableView.selectRowIndexes(IndexSet(displayedIDs.enumerated().compactMap { selected.contains($0.element) ? $0.offset : nil }), byExtendingSelection: false)
         emptyView.isHidden = !list.isEmpty
         tableView.isHidden = list.isEmpty
     }
 
     private func observeItems() {
+        let ids = Set(manager.items.map { $0.id })
+        observed = observed.filter { ids.contains($0.key) }
         for item in manager.items where observed[item.id] == nil {
             observed[item.id] = item.objectWillChange
                 .throttle(for: .milliseconds(150), scheduler: DispatchQueue.main, latest: true)
@@ -211,14 +234,17 @@ final class DownloadsContentController: NSObject {
 
     private func buildUI() {
         let header = makeHeader()
+        let controls = makeControls()
         let list = makeList()
         emptyView = makeEmptyState()
 
         let container = NSView()
         container.addSubview(header)
+        container.addSubview(controls)
         container.addSubview(list)
         container.addSubview(emptyView)
         header.translatesAutoresizingMaskIntoConstraints = false
+        controls.translatesAutoresizingMaskIntoConstraints = false
         list.translatesAutoresizingMaskIntoConstraints = false
         emptyView.translatesAutoresizingMaskIntoConstraints = false
         NSLayoutConstraint.activate([
@@ -226,7 +252,10 @@ final class DownloadsContentController: NSObject {
             header.topAnchor.constraint(equalTo: container.safeAreaLayoutGuide.topAnchor, constant: 8),
             header.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 20),
             header.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -20),
-            list.topAnchor.constraint(equalTo: header.bottomAnchor, constant: 8),
+            controls.topAnchor.constraint(equalTo: header.bottomAnchor, constant: 12),
+            controls.leadingAnchor.constraint(equalTo: header.leadingAnchor),
+            controls.trailingAnchor.constraint(equalTo: header.trailingAnchor),
+            list.topAnchor.constraint(equalTo: controls.bottomAnchor, constant: 8),
             list.leadingAnchor.constraint(equalTo: container.leadingAnchor),
             list.trailingAnchor.constraint(equalTo: container.trailingAnchor),
             list.bottomAnchor.constraint(equalTo: container.bottomAnchor),
@@ -248,12 +277,19 @@ final class DownloadsContentController: NSObject {
         addButton.font = .systemFont(ofSize: 12, weight: .semibold)
         addButton.controlSize = .regular
 
+        let videoButton = NSButton(title: " Add Video", target: self, action: #selector(addVideoClicked))
+        videoButton.bezelStyle = .rounded
+        videoButton.image = NSImage(systemSymbolName: "video", accessibilityDescription: "Add video")
+        videoButton.imagePosition = .imageLeading
+        videoButton.font = .systemFont(ofSize: 12, weight: .semibold)
+        videoButton.controlSize = .regular
+
         let titles = NSStackView(views: [headerField, subheaderField])
         titles.orientation = .vertical
         titles.alignment = .leading
         titles.spacing = 2
 
-        let row = NSStackView(views: [titles, addButton])
+        let row = NSStackView(views: [titles, videoButton, addButton])
         row.orientation = .horizontal
         row.spacing = 8
         row.alignment = .centerY
@@ -263,7 +299,41 @@ final class DownloadsContentController: NSObject {
         return row
     }
 
+    private func makeControls() -> NSView {
+        search.placeholderString = "Search downloads"; search.target = self; search.action = #selector(filterChanged)
+        statusFilter.addItems(withTitles: ["All states", "Active", "Queued", "Paused", "Failed", "Completed", "Cancelled"])
+        sortPicker.addItems(withTitles: ["Queue order", "Newest first", "Name", "Largest first"])
+        for picker in [statusFilter, sortPicker] { picker.target = self; picker.action = #selector(filterChanged) }
+        let actions = NSPopUpButton(frame: .zero, pullsDown: true)
+        actions.addItem(withTitle: "Actions")
+        for (title, selector) in [("Pause All", #selector(pauseAll)), ("Resume All", #selector(resumeAll)),
+                                  ("Add Multiple Links…", #selector(batch)), ("Video Options / Playlist…", #selector(media)),
+                                  ("Schedule Queue…", #selector(scheduleQueue)), ("Settings…", #selector(settings)),
+                                  ("Clear Completed History", #selector(clearCompleted))] {
+            actions.addItem(withTitle: title); actions.lastItem?.target = self; actions.lastItem?.action = selector
+        }
+        let row = NSStackView(views: [search, statusFilter, sortPicker, actions]); row.spacing = 6
+        search.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        search.widthAnchor.constraint(greaterThanOrEqualToConstant: 120).isActive = true
+        return row
+    }
+    @objc private func filterChanged() { reload() }
+    @objc func pauseAll() { manager.pauseAll() }
+    @objc func resumeAll() { manager.resumeAll() }
+    @objc func batch() { showPanel(BatchPanel(manager: manager)) }
+    @objc func media() { showPanel(MediaOptionsPanel(manager: manager)) }
+    @objc func settings() { showPanel(SettingsPanel(manager: manager)) }
+    @objc private func scheduleQueue() { showPanel(QueueSchedulePanel(manager: manager)) }
+    private func showPanel(_ panel: FormPanel) {
+        guard let window = viewController.view.window, window.attachedSheet == nil else { return }
+        controlPanel = panel; panel.present(on: window)
+    }
+    @objc private func clearCompleted() {
+        for item in manager.items where item.state == .completed { manager.remove(item, deleteFileFromDisk: false) }
+    }
+
     @objc private func addClicked() { onAdd?() }
+    @objc private func addVideoClicked() { onAddVideo?() }
 
     // MARK: - Right-click menu
 
@@ -273,6 +343,8 @@ final class DownloadsContentController: NSObject {
         menu.removeAllItems()
         let row = tableView.clickedRow
         guard let item = items[safe: row] else { return }
+        menuItemID = item.id
+        menuSelection = tableView.selectedRowIndexes.contains(row) ? tableView.selectedRowIndexes.compactMap { items[safe: $0]?.id } : [item.id]
 
         func add(_ title: String, _ action: Selector) {
             let mi = NSMenuItem(title: title, action: action, keyEquivalent: "")
@@ -292,6 +364,16 @@ final class DownloadsContentController: NSObject {
             add("Refresh Download…", #selector(menuRefresh(_:)))
         }
         menu.addItem(.separator())
+        add("Move Earlier", #selector(moveEarlier))
+        add("Move Later", #selector(moveLater))
+        add("Prioritize", #selector(prioritize))
+        add("Download Options…", #selector(itemOptions))
+        if item.state == .completed { add("Verify SHA-256…", #selector(verify)) }
+        if menuSelection.count > 1 {
+            add("Pause Selected", #selector(pauseSelected))
+            add("Resume Selected", #selector(resumeSelected))
+            add("Remove Selected…", #selector(removeSelected))
+        }
         add("Remove…", #selector(menuRemove(_:)))
     }
 
@@ -303,21 +385,66 @@ final class DownloadsContentController: NSObject {
     }
 
     @objc private func menuPause(_ sender: Any?) {
-        if let item = items[safe: tableView.clickedRow] { manager.pause(item) }
+        if let item = contextItem { manager.pause(item) }
     }
     @objc private func menuResume(_ sender: Any?) {
-        if let item = items[safe: tableView.clickedRow] { manager.retry(item) }
+        if let item = contextItem { manager.retry(item) }
     }
     @objc private func menuReveal(_ sender: Any?) {
-        if let item = items[safe: tableView.clickedRow] { manager.revealInFinder(item) }
+        if let item = contextItem { manager.revealInFinder(item) }
     }
     @objc private func menuRemove(_ sender: Any?) {
-        if let item = items[safe: tableView.clickedRow] { requestDelete(item) }
+        if let item = contextItem { requestDelete(item) }
     }
     @objc private func menuRefresh(_ sender: Any?) {
-        guard let item = items[safe: tableView.clickedRow] else { return }
+        guard let item = contextItem else { return }
         RefreshPanelController.present(item: item, manager: manager,
                                        on: viewController.view.window)
+    }
+
+    private var contextItem: DownloadItem? { manager.items.first { $0.id == menuItemID } }
+    @objc private func moveEarlier() { if let item = contextItem { manager.move(item, offset: -1) } }
+    @objc private func moveLater() { if let item = contextItem { manager.move(item, offset: 1) } }
+    @objc private func prioritize() { if let item = contextItem { manager.prioritize(item) } }
+    @objc private func itemOptions() { if let item = contextItem { showPanel(ItemOptionsPanel(manager: manager, item: item)) } }
+    @objc private func pauseSelected() { for item in manager.items where menuSelection.contains(item.id) { manager.pause(item) } }
+    @objc private func resumeSelected() { for item in manager.items where menuSelection.contains(item.id) { manager.retry(item) } }
+    @objc private func removeSelected() {
+        let alert = NSAlert(); alert.messageText = "Remove \(menuSelection.count) downloads?"
+        alert.informativeText = "Completed files stay on disk; partial files are deleted."
+        alert.addButton(withTitle: "Remove"); alert.addButton(withTitle: "Cancel")
+        if alert.runModal() == .alertFirstButtonReturn {
+            for item in manager.items where menuSelection.contains(item.id) { manager.remove(item, deleteFileFromDisk: false) }
+        }
+    }
+    @objc private func verify() {
+        guard let item = contextItem else { return }
+        let alert = NSAlert(); alert.messageText = "Verify SHA-256"
+        alert.informativeText = "Paste an expected checksum, or leave blank to calculate it."
+        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 450, height: 24)); field.stringValue = item.expectedSHA256 ?? ""
+        alert.accessoryView = field; alert.addButton(withTitle: "Verify"); alert.addButton(withTitle: "Cancel")
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        let raw = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard raw.isEmpty || DownloadInput.checksum(raw) != nil else {
+            let error = NSAlert(); error.messageText = "SHA-256 must contain 64 hexadecimal characters."; error.runModal(); return
+        }
+        let expected = DownloadInput.checksum(raw)
+        Task { @MainActor in
+            let result = NSAlert()
+            do {
+                let hash = try await Integrity.sha256(item.fileURL)
+                item.actualSHA256 = hash; item.expectedSHA256 = expected
+                result.messageText = expected == nil ? "SHA-256 calculated" : expected == hash ? "Checksum matches" : "Checksum mismatch"
+                result.informativeText = hash
+                manager.saveHistory()
+            } catch { result.messageText = "Verification failed"; result.informativeText = error.localizedDescription }
+            result.runModal()
+        }
+    }
+
+    @objc private func rowDoubleClicked(_ sender: Any?) {
+        guard let item = items[safe: tableView.clickedRow], item.state == .completed else { return }
+        NSWorkspace.shared.open(item.fileURL)
     }
 
     private func makeList() -> NSView {
@@ -329,8 +456,13 @@ final class DownloadsContentController: NSObject {
         tableView.delegate = self
         tableView.style = .inset
         tableView.rowHeight = 84
-        tableView.selectionHighlightStyle = .none
+        tableView.selectionHighlightStyle = .regular
+        tableView.allowsMultipleSelection = true
+        tableView.registerForDraggedTypes([.URL, .string])
         tableView.backgroundColor = .clear
+        // double-clicking a finished download opens it with its default app
+        tableView.target = self
+        tableView.doubleAction = #selector(rowDoubleClicked(_:))
         let ctxMenu = NSMenu()
         ctxMenu.delegate = self
         tableView.menu = ctxMenu
@@ -380,6 +512,12 @@ final class DownloadsContentController: NSObject {
 }
 
 extension DownloadsContentController: NSTableViewDataSource, NSTableViewDelegate, NSMenuDelegate {
+    func tableView(_ tableView: NSTableView, validateDrop info: NSDraggingInfo, proposedRow row: Int, proposedDropOperation operation: NSTableView.DropOperation) -> NSDragOperation { .copy }
+    func tableView(_ tableView: NSTableView, acceptDrop info: NSDraggingInfo, row: Int, dropOperation: NSTableView.DropOperation) -> Bool {
+        let pasteboard = info.draggingPasteboard
+        guard let text = pasteboard.string(forType: .URL) ?? pasteboard.string(forType: .string) else { return false }
+        return manager.addBatch(text).added > 0
+    }
     func numberOfRows(in tableView: NSTableView) -> Int { items.count }
 
     func tableView(_ tableView: NSTableView, rowViewForRow row: Int) -> NSTableRowView? {
@@ -512,6 +650,7 @@ final class DownloadCardCell: NSView {
         icon.image = NSImage(systemSymbolName: item.category.symbol, accessibilityDescription: nil)
         icon.contentTintColor = item.category.accent
         titleLabel.stringValue = item.displayTitle
+        titleLabel.toolTip = item.displayTitle
 
         let size = item.state == .completed
             ? Self.sizeString(item).components(separatedBy: " / ").last ?? Self.sizeString(item)
@@ -519,13 +658,19 @@ final class DownloadCardCell: NSView {
         var subtitle = size
         if item.state == .downloading && item.speedBPS > 1 {
             subtitle += " · \(Self.speedString(item.speedBPS))"
+            if let eta = item.eta { subtitle += " · \(eta) left" }
         }
-        if item.state == .downloading && !item.segments.isEmpty && !item.isVideoTask {
+        if item.state == .downloading && !item.segments.isEmpty && !item.usedYtDlp {
             subtitle += " · \(item.segments.count) segments"
-        } else if item.isVideoTask {
+        } else if item.usedYtDlp {
             subtitle += " · yt-dlp"
         }
+        if item.verifying { subtitle += " · verifying SHA-256…" }
+        if item.state == .failed { subtitle = item.error ?? "Download failed" }
+        if let retry = item.retryAt { subtitle += " · retry \(item.retryCount) in \(max(0, Int(retry.timeIntervalSinceNow)))s" }
+        if let scheduled = item.scheduledAt { subtitle += " · \(scheduled.formatted(date: .abbreviated, time: .shortened))" }
         subtitleLabel.stringValue = subtitle
+        subtitleLabel.toolTip = item.error ?? subtitle
 
         pctLabel.stringValue = item.totalBytes > 0
             ? "\(Int((item.progress * 100).rounded()))%" : ""

@@ -5,7 +5,8 @@ const VIDEO_HOSTS = [
   "youtube.com", "youtu.be", "vimeo.com", "twitter.com", "x.com",
   "tiktok.com", "instagram.com", "facebook.com", "twitch.tv",
   "soundcloud.com", "dailymotion.com", "reddit.com", "bandcamp.com",
-  "rumble.com", "odysee.com", "bitchute.com", "bilibili.com"
+  "rumble.com", "odysee.com", "bitchute.com", "bilibili.com",
+  "kick.com"
 ];
 
 // File types that should be handed to macdm instead of Chrome's downloader.
@@ -18,6 +19,7 @@ const FILE_EXTENSIONS = [
   "txt","rtf","csv","md",
   // programs / archives
   "dmg","pkg","zip","tar","gz","bz2","xz","7z","rar","iso","deb","rpm","apk","exe",
+  "tgz","tbz2","txz","zst","jar","lz4","lzma","cab","lzh","arj",
   // other
   "torrent","jar","bin"
 ];
@@ -50,27 +52,78 @@ function isSupportedFile(url, filename) {
  *  blob:/data: sources are MediaSource streams that only resolve inside this
  *  tab — they cannot be fetched by any external downloader, so they are
  *  counted but not listed (the page link itself goes through yt-dlp).
+ *  Also regexes the page source for embedded HLS/DASH playlists: sites like
+ *  Kick ship the tokenized master.m3u8 in the server-rendered HTML, so it is
+ *  offerable before playback and survives service-worker restarts (the
+ *  webRequest capture loses history when the worker idles out).
  *  Non-video files are deliberately NOT scanned — the icon only ever shows
  *  videos; other files are picked up by the downloads.onCreated interceptor
  *  when the browser actually starts downloading them. */
 function scanPage() {
-  const out = { videos: [], blobVideos: 0 };
-  document.querySelectorAll("video, audio, source").forEach(v => {
-    const src = v.src || v.currentSrc;
-    if (!src) return;
-    if (src.startsWith("blob:") || src.startsWith("data:")) { out.blobVideos++; return; }
-    const h = v.videoHeight || 0;
-    const name = decodeURIComponent(new URL(src).pathname.split("/").pop() || src).slice(0, 70);
-    out.videos.push({ src, name: name || "media", height: h });
+  const out = { videos: [], blobVideos: 0, sourceStreams: [] };
+  const seen = new Set();
+  function addMedia(raw, height = 0) {
+    if (!raw) return;
+    if (/^(blob|data):/.test(raw)) { out.blobVideos++; return; }
+    try {
+      const url = new URL(raw, location.href);
+      if (!/^https?:$/.test(url.protocol) || seen.has(url.href)) return;
+      seen.add(url.href);
+      let name = url.pathname.split("/").pop() || "media";
+      try { name = decodeURIComponent(name); } catch {}
+      out.videos.push({ src: url.href, name: name.slice(0, 70), height });
+    } catch {}
+  }
+  function walk(root) {
+    root.querySelectorAll("video, audio").forEach(v => {
+      addMedia(v.currentSrc || v.src, v.videoHeight || 0);
+      v.querySelectorAll("source").forEach(source => addMedia(source.src, v.videoHeight || 0));
+    });
+    root.querySelectorAll("*").forEach(el => { if (el.shadowRoot) walk(el.shadowRoot); });
+  }
+  walk(document);
+  document.querySelectorAll('meta[property="og:video"], meta[property="og:video:url"], meta[property="og:video:secure_url"], meta[itemprop="contentUrl"]').forEach(meta => {
+    // Only concrete media URLs: og:video often points at an HTML embed.
+    if (/\.(mp4|webm|mov|m4v)([?#]|$)/i.test(meta.content)) addMedia(meta.content);
   });
+  const urls = new Set();
+  const re = /https:(?:\\u002F|\\\/|\/)[^"'`\s<>\\]*?\\?\.m(?:3u8|pd)[^"'`\s<>\\]*/gi;
+  for (const m of document.documentElement.innerHTML.matchAll(re)) {
+    let u = m[0]
+      .replace(/\\u002F/gi, "/")
+      .replace(/\\\//g, "/")
+      .replace(/\\(?=\r?\n)/g, "")
+      .replace(/\\+/g, "")
+      .replace(/[.,;:!?)\]}'"]+$/, "");
+    if (/^https:\/\/[^/]+\/.+/i.test(u)) urls.add(u);
+    if (urls.size >= 10) break;
+  }
+  for (const src of urls) {
+    let name = "stream";
+    try { name = decodeURIComponent(new URL(src).pathname.split("/").pop() || name).slice(0, 70); } catch {}
+    out.sourceStreams.push({ src, name, kind: /\.mpd(\?|#|$)/i.test(src) ? "DASH" : "HLS" });
+  }
   return out;
 }
 
 async function scanTab(tabId) {
   const results = await chrome.scripting
-    .executeScript({ target: { tabId }, func: scanPage })
+    .executeScript({ target: { tabId, allFrames: true }, func: scanPage })
     .catch(() => null);
-  return results ? results[0].result : { videos: [], blobVideos: 0 };
+  const out = { videos: [], blobVideos: 0, sourceStreams: [] };
+  const videos = new Map(), playlists = new Map();
+  for (const frame of results || []) {
+    const found = frame.result;
+    if (!found) continue;
+    out.blobVideos += found.blobVideos || 0;
+    for (const video of found.videos || []) {
+      if (!videos.has(video.src) || video.height > videos.get(video.src).height) videos.set(video.src, video);
+    }
+    for (const stream of found.sourceStreams || []) playlists.set(stream.src, stream);
+  }
+  out.videos = [...videos.values()];
+  out.sourceStreams = [...playlists.values()];
+  return out;
 }
 
 /** Browser context for the app: cookies + user agent for this URL. */
@@ -92,11 +145,19 @@ const scans = new Map(); // tabId -> {url, title, videos, streams, blobVideos, i
 function streamEntries(tabId) {
   const m = streams.get(tabId);
   if (!m) return [];
-  return [...m.keys()].map(url => {
+  return [...m.entries()].map(([url, kind]) => {
     let name = "stream";
     try { name = decodeURIComponent(new URL(url).pathname.split("/").pop() || name).slice(0, 70); } catch {}
-    return { src: url, name, kind: /\.mpd(\?|#|$)/i.test(url) ? "DASH" : "HLS" };
+    return { src: url, name, kind };
   });
+}
+
+/** Captured network playlists + ones embedded in the page source, deduped. */
+function mergedStreams(tabId, sourceStreams) {
+  const byUrl = new Map();
+  for (const s of sourceStreams || []) byUrl.set(s.src, s);
+  for (const s of streamEntries(tabId)) if (!byUrl.has(s.src)) byUrl.set(s.src, s);
+  return [...byUrl.values()];
 }
 
 function setBadge(tabId, scan) {
@@ -115,7 +176,8 @@ async function autoScan(tabId, url, title) {
   const scan = {
     url, title: title || url,
     videos: found.videos || [],
-    streams: streamEntries(tabId),
+    sourceStreams: found.sourceStreams || [],
+    streams: mergedStreams(tabId, found.sourceStreams),
     blobVideos: found.blobVideos || 0,
     isVideoSite: isVideoSite(url),
   };
@@ -130,22 +192,30 @@ async function autoScan(tabId, url, title) {
 const STREAM_RE = /\.(m3u8|m3u|mpd)(\?|#|$)/i;
 const streams = new Map(); // tabId -> Map(url -> true)
 
-chrome.webRequest.onBeforeRequest.addListener(details => {
-  if (details.tabId < 0) return;                    // request not from a tab
-  const url = details.url;
-  if (!url.startsWith("http") || !STREAM_RE.test(url)) return;
+function captureStream(details, kind) {
+  if (details.tabId < 0 || !/^https?:/.test(details.url)) return;
   let m = streams.get(details.tabId);
   if (!m) { m = new Map(); streams.set(details.tabId, m); }
-  if (m.has(url)) return;
-  m.set(url, true);
-  if (m.size > 30) m.delete(m.keys().next().value); // cap: variant playlists add up
-  // merge into the tab's cached scan (if one exists) and refresh the badge
+  m.set(details.url, kind);
+  if (m.size > 30) m.delete(m.keys().next().value);
   const scan = scans.get(details.tabId);
   if (scan) {
-    scan.streams = streamEntries(details.tabId);
+    scan.streams = mergedStreams(details.tabId, scan.sourceStreams);
     setBadge(details.tabId, scan);
   }
+}
+
+chrome.webRequest.onBeforeRequest.addListener(details => {
+  if (STREAM_RE.test(details.url)) captureStream(details, /\.mpd([?#]|$)/i.test(details.url) ? "DASH" : "HLS");
 }, { urls: ["<all_urls>"] });
+
+// Signed CDN endpoints often have no file extension. Response MIME identifies them.
+chrome.webRequest.onHeadersReceived.addListener(details => {
+  if (details.statusCode < 200 || details.statusCode >= 300) return;
+  const mime = details.responseHeaders?.find(h => h.name.toLowerCase() === "content-type")?.value?.split(";")[0].trim().toLowerCase();
+  if (["application/vnd.apple.mpegurl", "application/x-mpegurl", "audio/mpegurl", "audio/x-mpegurl"].includes(mime)) captureStream(details, "HLS");
+  else if (mime === "application/dash+xml") captureStream(details, "DASH");
+}, { urls: ["<all_urls>"] }, ["responseHeaders"]);
 
 chrome.runtime.onInstalled.addListener(() => {
   chrome.contextMenus.create({
@@ -153,11 +223,18 @@ chrome.runtime.onInstalled.addListener(() => {
     title: "Download with macdm",
     contexts: ["link", "page", "video", "audio"],
   });
-  chrome.storage.local.set({ [INTERCEPT_KEY]: INTERCEPT_DEFAULT });
+  chrome.storage.local.setAccessLevel?.({ accessLevel: "TRUSTED_CONTEXTS" });
+  chrome.storage.local.get(INTERCEPT_KEY).then(stored => {
+    if (stored[INTERCEPT_KEY] == null) chrome.storage.local.set({ [INTERCEPT_KEY]: INTERCEPT_DEFAULT });
+  });
 });
 
 chrome.tabs.onUpdated.addListener((tabId, change, tab) => {
-  if (change.status === "complete" && tab.url) {
+  if (change.status === "loading") {
+    scans.delete(tabId); streams.delete(tabId);
+    chrome.action.setBadgeText({ text: "", tabId });
+  }
+  if ((change.status === "complete" || change.url) && tab.url) {
     autoScan(tabId, tab.url, tab.title);
   }
 });
@@ -192,7 +269,8 @@ chrome.downloads.onCreated.addListener(async downloadItem => {
   try { await chrome.downloads.erase({ id: downloadItem.id }); } catch {}
 
   const ctx = await browserContext(url);
-  sendToMacDM(url, null, downloadItem.referrer || null, ctx.cookies, ctx.userAgent);
+  sendToMacDM(url, null, downloadItem.referrer || null, ctx.cookies, ctx.userAgent,
+              { filename: downloadItem.filename, mime: downloadItem.mimeType });
 });
 
 chrome.contextMenus.onClicked.addListener(async (info, tab) => {
@@ -203,13 +281,20 @@ chrome.contextMenus.onClicked.addListener(async (info, tab) => {
   await sendToMacDM(url, null, info.pageUrl || tab?.url || null, ctx.cookies, ctx.userAgent);
 });
 
-async function sendToMacDM(url, maxHeight, referrer, cookies, userAgent) {
+async function sendToMacDM(url, maxHeight, referrer, cookies, userAgent, hints) {
   try {
     const body = { url };
     if (maxHeight) body.maxHeight = maxHeight;
     if (referrer) body.referrer = referrer;
     if (cookies) body.cookies = cookies;
     if (userAgent) body.userAgent = userAgent;
+    if (hints?.filename) body.filename = hints.filename;
+    if (hints?.mime) body.mime = hints.mime;
+    // video intent (overlay pill, popup page rows): the link is a video page
+    // or media stream, so macdm must route it through yt-dlp even when the
+    // host isn't on its known list — otherwise a page URL would be saved as
+    // an HTML file
+    if (hints?.video) body.forceVideo = true;
     const res = await fetch(MACDM_URL, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -236,19 +321,17 @@ async function lookupInfo(url) {
   }
 }
 
-chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
+chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg?.type === "macdm-add" && msg.url) {
     (async () => {
       const ctx = await browserContext(msg.url);
       const ok = await sendToMacDM(msg.url, msg.maxHeight, msg.referrer,
-                                   ctx.cookies, ctx.userAgent);
+                                   ctx.cookies, ctx.userAgent, { video: msg.video });
       sendResponse({ ok });
     })();
     return true;
   }
   if (msg?.type === "macdm-scan" && msg.tabId != null) {
-    const cached = scans.get(msg.tabId);
-    if (cached) { sendResponse(cached); return true; }
     chrome.tabs.get(msg.tabId, tab => {
       if (tab?.url) {
         autoScan(msg.tabId, tab.url, tab.title).then(() => sendResponse(scans.get(msg.tabId)));

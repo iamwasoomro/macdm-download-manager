@@ -19,6 +19,33 @@
     return /^https?:/.test(src) ? src : "";
   }
 
+  // Some sites (Kick VODs, for one) embed the real HLS/DASH playlist straight
+  // into the server-rendered page — yt-dlp's site extractor can be broken
+  // (Kick moved their API), but the tokenized m3u8 in the source downloads
+  // fine. Regex the DOM/inline scripts for playlist URLs so the pill menu can
+  // offer them even before the player has fetched anything.
+  function sourceStreams() {
+    const re = /https:(?:\\u002F|\\\/|\/)[^"'`\s<>\\]*?\\?\.m(?:3u8|pd)[^"'`\s<>\\]*/gi;
+    const urls = new Set();
+    for (const m of document.documentElement.innerHTML.matchAll(re)) {
+      let u = m[0]
+        .replace(/\\u002F/gi, "/")
+        .replace(/\\\//g, "/")
+        .replace(/\\(?=\r?\n)/g, "")   // JS line continuations inside the token
+        .replace(/\\+/g, "")           // any leftover escapes are never legal in URLs
+        .replace(/[.,;:!?)\]}'"]+$/, "");
+      if (/^https:\/\/[^/]+\/.+/i.test(u)) urls.add(u);
+      if (urls.size >= 10) break;
+    }
+    return [...urls];
+  }
+
+  function streamName(url) {
+    try {
+      return decodeURIComponent(new URL(url).pathname.split("/").pop() || url).slice(0, 70) || "stream";
+    } catch { return "stream"; }
+  }
+
   function heightLabel(v) {
     const h = v.videoHeight;
     if (!h) return "";
@@ -54,7 +81,7 @@
   async function send(url, v, pill) {
     setPill(pill, "Sending…", "busy");
     let res = null;
-    try { res = await chrome.runtime.sendMessage({ type: "macdm-add", url, referrer: location.href }); }
+    try { res = await chrome.runtime.sendMessage({ type: "macdm-add", url, referrer: location.href, video: true }); }
     catch { /* app/extension race */ }
     if (res?.ok) {
       setPill(pill, "Sent to macdm ✓", "ok");
@@ -71,22 +98,24 @@
     for (const st of overlays.values()) st.menu.classList.remove("macdm-open");
   }
 
+  function addMenuRow(menu, url, name, kind, st) {
+    const b = document.createElement("button");
+    b.className = "macdm-row";
+    b.type = "button";
+    const label = document.createElement("span");
+    label.textContent = name;
+    label.title = url;
+    const tag = document.createElement("em");
+    tag.textContent = kind;
+    b.append(label, tag);
+    b.onclick = e => { e.stopPropagation(); closeAllMenus(); send(url, st.video, st.pill); };
+    menu.append(b);
+  }
+
   function openMenu(st, streams) {
     const menu = st.menu;
     menu.textContent = "";
-    for (const s of streams) {
-      const b = document.createElement("button");
-      b.className = "macdm-row";
-      b.type = "button";
-      const name = document.createElement("span");
-      name.textContent = s.name;
-      name.title = s.src;
-      const kind = document.createElement("em");
-      kind.textContent = s.kind || "stream";
-      b.append(name, kind);
-      b.onclick = e => { e.stopPropagation(); closeAllMenus(); send(s.src, st.video, st.pill); };
-      menu.append(b);
-    }
+    for (const s of streams) addMenuRow(menu, s.src, s.name, s.kind || "stream", st);
     const page = document.createElement("button");
     page.className = "macdm-row";
     page.type = "button";
@@ -105,12 +134,16 @@
     if (st.menu.classList.contains("macdm-open")) { closeAllMenus(); return; }
     const direct = videoUrl(v);
     if (direct) { send(direct, v, st.pill); return; }
-    // blob player: prefer the playlists the background caught on this tab
-    let streams = [];
+    // blob player: offer every playlist this tab shows — the ones the
+    // background caught on the network plus the ones embedded in the page
+    // source (works before playback and after service-worker restarts)
+    const byUrl = new Map();
+    for (const src of sourceStreams()) byUrl.set(src, { src, name: streamName(src), kind: /\.mpd(\?|#|$)/i.test(src) ? "DASH" : "HLS" });
     try {
       const res = await chrome.runtime.sendMessage({ type: "macdm-streams" });
-      streams = res?.streams || [];
+      for (const s of res?.streams || []) if (!byUrl.has(s.src)) byUrl.set(s.src, s);
     } catch { /* fall through to the page url */ }
+    const streams = [...byUrl.values()];
     if (streams.length) { openMenu(st, streams); return; }
     send(location.href, v, st.pill);
   }

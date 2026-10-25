@@ -1,117 +1,128 @@
 import Foundation
+import CryptoKit
 
-/// Minimal local HTTP server (port 7210) so the Chrome extension can POST
-/// URLs into the app:  POST /add  {"url": "..."}
-/// CORS-enabled so the extension's fetch succeeds.
 final class ExtensionServer {
     static let shared = ExtensionServer()
-    private var server: SocketPort?
-    private var running = false
+    private var listener: Int32 = -1
+    private let lock = NSLock()
+    private var clients = 0
     var onURL: ((IncomingDownload) -> Void)?
-
     func start(port: Int = 7210) {
-        guard !running else { return }
-        guard let socket = try? SocketPort(tcpPort: UInt16(port)) else {
-            NSLog("MacDM: cannot bind port \(port)")
-            return
+        guard listener < 0 else { return }
+        let fd = socket(AF_INET, SOCK_STREAM, 0)
+        guard fd >= 0 else { return }
+        var yes: Int32 = 1
+        setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, socklen_t(MemoryLayout<Int32>.size))
+        var addr = sockaddr_in()
+        addr.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+        addr.sin_family = sa_family_t(AF_INET)
+        addr.sin_port = UInt16(port).bigEndian
+        addr.sin_addr = in_addr(s_addr: inet_addr("127.0.0.1"))
+        let result = withUnsafePointer(to: &addr) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { bind(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size)) }
         }
-        running = true
-        server = socket
-        receiveLoop(on: socket)
-        NSLog("MacDM extension server listening on 127.0.0.1:\(port)")
-    }
-
-    private func receiveLoop(on socket: SocketPort) {
-        // We use a raw accept loop via file descriptor through NSFileStream-free
-        // approach: SocketPort messages are macOS-native; for HTTP we instead
-        // poll the accepted connections through a background thread.
-        Thread.detachNewThread {
-            let fd = socket.socket
-            var yes: Int32 = 1
-            setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, socklen_t(MemoryLayout<Int32>.size))
-            while self.running {
-                var addr = sockaddr()
-                var len = socklen_t(MemoryLayout<sockaddr>.size)
-                let client = accept(fd, &addr, &len)
-                guard client >= 0 else { break }
-                Thread.detachNewThread { self.handle(clientFD: client) }
+        guard result == 0, listen(fd, 16) == 0 else { close(fd); NSLog("MacDM: cannot bind extension port"); return }
+        listener = fd
+        Thread.detachNewThread { [weak self] in
+            guard let self else { return }
+            while true {
+                let client = accept(fd, nil, nil)
+                if client < 0 { break }
+                self.lock.lock()
+                let allowed = self.clients < 16
+                if allowed { self.clients += 1 }
+                self.lock.unlock()
+                if !allowed { close(client); continue }
+                Thread.detachNewThread {
+                    self.handle(clientFD: client)
+                    self.lock.lock(); self.clients -= 1; self.lock.unlock()
+                }
             }
         }
     }
 
     private func handle(clientFD: Int32) {
         defer { close(clientFD) }
-        // Read until end of headers + body per Content-Length (small requests)
-        var request = Data()
-        let bufferSize = 65536
-        var buffer = [UInt8](repeating: 0, count: bufferSize)
-        while true {
-            let n = recv(clientFD, &buffer, bufferSize, 0)
-            guard n > 0 else { break }
-            request.append(contentsOf: buffer[0..<n])
-            if let headerEnd = request.range(of: Data("\r\n\r\n".utf8)) {
-                let headers = String(data: request[..<headerEnd.lowerBound], encoding: .utf8) ?? ""
-                let contentLength = headers
-                    .split(separator: "\r\n")
-                    .first { $0.lowercased().hasPrefix("content-length:") }
-                    .flatMap { Int($0.split(separator: ":")[1].trimmingCharacters(in: .whitespaces)) } ?? 0
-                if request.count >= headerEnd.upperBound + contentLength { break }
-            }
-            if request.count > 1_048_576 { break }
+        var timeout = timeval(tv_sec: 5, tv_usec: 0), yes: Int32 = 1
+        setsockopt(clientFD, SOL_SOCKET, SO_RCVTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size))
+        setsockopt(clientFD, SOL_SOCKET, SO_SNDTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size))
+        setsockopt(clientFD, SOL_SOCKET, SO_NOSIGPIPE, &yes, socklen_t(MemoryLayout<Int32>.size))
+        var data = Data(), buffer = [UInt8](repeating: 0, count: 8192)
+        var headerEnd: Range<Data.Index>?
+        while headerEnd == nil {
+            let count = recv(clientFD, &buffer, buffer.count, 0)
+            guard count > 0 else { return }
+            data.append(contentsOf: buffer.prefix(count))
+            headerEnd = data.range(of: Data("\r\n\r\n".utf8))
+            if data.count > 65536 { respond(clientFD, status: "431 Request Header Fields Too Large"); return }
         }
-
-        let head = String(data: request.prefix(while: { $0 != 0x0D }), encoding: .utf8) ?? ""
-        let body: Data
-        if let headerEnd = request.range(of: Data("\r\n\r\n".utf8)) {
-            body = request[headerEnd.upperBound...]
+        guard let end = headerEnd, let head = String(data: data[..<end.lowerBound], encoding: .utf8) else { return }
+        let lines = head.components(separatedBy: "\r\n")
+        let request = (lines.first ?? "").split(separator: " ")
+        guard request.count == 3 else { respond(clientFD, status: "400 Bad Request"); return }
+        var headers: [String: String] = [:]
+        for line in lines.dropFirst() {
+            guard let split = line.firstIndex(of: ":") else { respond(clientFD, status: "400 Bad Request"); return }
+            let key = line[..<split].lowercased()
+            guard headers[key] == nil else { respond(clientFD, status: "400 Bad Request"); return }
+            headers[key] = line[line.index(after: split)...].trimmingCharacters(in: .whitespaces)
+        }
+        let origin = headers["origin"]
+        guard origin == nil || (origin?.range(of: "^chrome-extension://[a-p]{32}$", options: .regularExpression) != nil) else {
+            respond(clientFD, status: "403 Forbidden"); return
+        }
+        let method = String(request[0]), path = String(request[1])
+        guard ["/add", "/info"].contains(path) else { respond(clientFD, status: "404 Not Found", origin: origin); return }
+        if method == "OPTIONS" { respond(clientFD, status: "204 No Content", origin: origin); return }
+        guard method == "POST" else { respond(clientFD, status: "405 Method Not Allowed", origin: origin); return }
+        guard headers["content-type"]?.lowercased().hasPrefix("application/json") == true,
+              headers["transfer-encoding"] == nil,
+              let length = Int(headers["content-length"] ?? ""), (1...262144).contains(length) else {
+            respond(clientFD, status: "400 Bad Request", origin: origin); return
+        }
+        while data.count < end.upperBound + length {
+            let count = recv(clientFD, &buffer, min(buffer.count, end.upperBound + length - data.count), 0)
+            guard count > 0 else { return }
+            data.append(contentsOf: buffer.prefix(count))
+        }
+        let body = data.subdata(in: end.upperBound..<(end.upperBound + length))
+        guard let object = try? JSONSerialization.jsonObject(with: body) as? [String: Any],
+              let raw = object["url"] as? String, raw.count <= 16384, let url = DownloadInput.url(raw) else {
+            respond(clientFD, status: "400 Bad Request", origin: origin); return
+        }
+        for key in ["cookies", "userAgent", "referrer", "filename"] {
+            if let value = object[key] as? String, value.rangeOfCharacter(from: .newlines) != nil {
+                respond(clientFD, status: "400 Bad Request", origin: origin); return
+            }
+        }
+        if let height = object["maxHeight"] as? Int, !(144...8640).contains(height) { respond(clientFD, status: "400 Bad Request", origin: origin); return }
+        if path == "/info" {
+            let payload = Self.lookupInfo(url: url, cookies: object["cookies"] as? String, userAgent: object["userAgent"] as? String)
+            respond(clientFD, status: payload == nil ? "502 Bad Gateway" : "200 OK", body: payload ?? "{\"error\":\"lookup failed\"}", origin: origin)
         } else {
-            body = Data()
+            let incoming = IncomingDownload(url: url, maxHeight: object["maxHeight"] as? Int,
+                referrer: object["referrer"] as? String, cookies: object["cookies"] as? String,
+                userAgent: object["userAgent"] as? String, filename: object["filename"] as? String,
+                mimeType: object["mime"] as? String, forceVideo: object["forceVideo"] as? Bool ?? false)
+            DispatchQueue.main.async { self.onURL?(incoming) }
+            respond(clientFD, status: "200 OK", body: "{\"ok\":true}", origin: origin)
         }
-
-        var status = "200 OK"
-        var responseBody = "{\"ok\":true}"
-        if head.hasPrefix("OPTIONS") {
-            // CORS preflight
-            let response = "HTTP/1.1 204 No Content\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: POST, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
-            _ = response.withCString { ptr in send(clientFD, ptr, Darwin.strlen(ptr), 0) }
-            return
+    }
+    private func respond(_ fd: Int32, status: String, body: String = "{}", origin: String? = nil) {
+        var headers = "HTTP/1.1 \(status)\r\nContent-Type: application/json\r\nConnection: close\r\n"
+        if let origin {
+            headers += "Access-Control-Allow-Origin: \(origin)\r\nVary: Origin\r\nAccess-Control-Allow-Methods: POST, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type\r\n"
         }
-        if head.hasPrefix("POST") {
-            // First line looks like "POST /info HTTP/1.1"
-            let path = head.split(separator: " ").dropFirst().first.map(String.init) ?? "/"
-            if path.hasPrefix("/info") {
-                // Quality/title lookup for the extension popup: {"url": "..."} →
-                // {"title": "...", "heights": [2160, 1080, ...]}
-                if let obj = try? JSONSerialization.jsonObject(with: body) as? [String: Any],
-                   let url = obj["url"] as? String {
-                    let payload = Self.lookupInfo(url: url,
-                                                  cookies: obj["cookies"] as? String,
-                                                  userAgent: obj["userAgent"] as? String)
-                    responseBody = payload ?? "{\"error\":\"lookup failed\"}"
-                    if payload == nil { status = "502 Bad Gateway" }
-                } else {
-                    status = "400 Bad Request"
-                    responseBody = "{\"error\":\"expected {\\\"url\\\": ...}\"}"
-                }
-            } else if let obj = try? JSONSerialization.jsonObject(with: body) as? [String: Any],
-                      let url = obj["url"] as? String {
-                let incoming = IncomingDownload(
-                    url: url,
-                    maxHeight: obj["maxHeight"] as? Int,
-                    referrer: obj["referrer"] as? String,
-                    cookies: obj["cookies"] as? String,
-                    userAgent: obj["userAgent"] as? String
-                )
-                DispatchQueue.main.async { self.onURL?(incoming) }
-                responseBody = "{\"ok\":true,\"url\":\"\(url)\"}"
-            } else {
-                status = "400 Bad Request"
-                responseBody = "{\"error\":\"expected {\\\"url\\\": ...}\"}"
+        let responseBody = status.hasPrefix("204") ? "" : body
+        let bytes = Data((headers + "Content-Length: \(responseBody.utf8.count)\r\n\r\n" + responseBody).utf8)
+        bytes.withUnsafeBytes { raw in
+            guard let base = raw.baseAddress else { return }
+            var offset = 0
+            while offset < bytes.count {
+                let sent = send(fd, base.advanced(by: offset), bytes.count - offset, 0)
+                if sent <= 0 { break }; offset += sent
             }
         }
-
-        let response = "HTTP/1.1 \(status)\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: \(responseBody.utf8.count)\r\nConnection: close\r\n\r\n\(responseBody)"
-        _ = response.withCString { ptr in send(clientFD, ptr, Darwin.strlen(ptr), 0) }
     }
 
     private static let cacheLock = NSLock()
@@ -122,8 +133,9 @@ final class ExtensionServer {
     /// Retries transient failures and serves a 5-minute cache so the popup
     /// doesn't degrade to "best available" on a flaky fetch.
     private static func lookupInfo(url: String, cookies: String? = nil, userAgent: String? = nil) -> String? {
+        let key = SHA256.hash(data: Data((url + "\n" + (cookies ?? "") + "\n" + (userAgent ?? "")).utf8)).map { String(format: "%02x", $0) }.joined()
         cacheLock.lock()
-        if let hit = infoCache[url], Date().timeIntervalSince(hit.date) < cacheTTL {
+        if let hit = infoCache[key], Date().timeIntervalSince(hit.date) < cacheTTL {
             let payload = hit.payload
             cacheLock.unlock()
             return payload
@@ -138,7 +150,8 @@ final class ExtensionServer {
         }
 
         cacheLock.lock()
-        infoCache[url] = (Date(), result)
+        if infoCache.count > 100 { infoCache.removeAll() }
+        if result != nil { infoCache[key] = (Date(), result) }
         cacheLock.unlock()
         return result
     }
@@ -146,7 +159,7 @@ final class ExtensionServer {
     private static func attemptInfo(url: String, cookies: String?, userAgent: String?) -> String? {
         let sem = DispatchSemaphore(value: 0)
         var result: String?
-        Task {
+        let lookup = Task {
             defer { sem.signal() }
             guard let info = try? await VideoDetector.fetchInfo(url: url, cookies: cookies, userAgent: userAgent) else { return }
             let heights = VideoDetector.availableHeights(info)
@@ -156,15 +169,15 @@ final class ExtensionServer {
             ]
             result = String(data: (try? JSONSerialization.data(withJSONObject: obj)) ?? Data(), encoding: .utf8)
         }
-        if sem.wait(timeout: .now() + 12) == .timedOut {
+        // 20s: cookie-less fallback retry inside fetchInfo adds a second run
+        if sem.wait(timeout: .now() + 20) == .timedOut {
+            lookup.cancel()
             return nil
         }
         return result
     }
 
     func stop() {
-        running = false
-        server?.invalidate()
-        server = nil
+        if listener >= 0 { shutdown(listener, SHUT_RDWR); close(listener); listener = -1 }
     }
 }

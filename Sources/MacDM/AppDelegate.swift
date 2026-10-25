@@ -3,14 +3,25 @@ import Combine
 
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
+    private var toolbarDelegate: ToolbarDelegate?
+    private var historyTimer: Timer?
     var window: NSWindow!
     let manager = DownloadManager()
     var sidebar: CategorySidebar!
     var content: DownloadsContentController!
     var statusBar: StatusBarController!
     var addPanelController: AddPanelController!
+    var videoPanelController: VideoPanelController!
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        manager.restoreHistory()
+        historyTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
+            Task { @MainActor in
+                self?.manager.tick()
+                self?.content?.reload()
+                if Int(Date().timeIntervalSince1970) % 5 == 0 { self?.manager.saveHistory() }
+            }
+        }
         content = DownloadsContentController(manager: manager)
         sidebar = CategorySidebar(manager: manager) { [weak self] category in
             self?.content.show(category: category)
@@ -19,7 +30,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             guard let w = self?.window else { return }
             self?.addPanelController.present(on: w)
         }
+        content.onAddVideo = { [weak self] in
+            guard let w = self?.window else { return }
+            self?.videoPanelController.present(on: w)
+        }
         addPanelController = AddPanelController(manager: manager)
+        videoPanelController = VideoPanelController(manager: manager)
+        videoPanelController.onSubmitted = { [weak self] in
+            self?.content.show(category: .videos)
+        }
         statusBar = StatusBarController(manager: manager) { [weak self] in
             self?.window.makeKeyAndOrderFront(nil)
             NSApp.activate(ignoringOtherApps: true)
@@ -79,6 +98,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         window.titlebarAppearsTransparent = true
         window.contentView = split
         window.toolbar = makeToolbar()
+        window.minSize = NSSize(width: 980, height: 600)
+        makeMenu()
         window.center()
         window.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
@@ -97,62 +118,123 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         ExtensionServer.shared.start()
 
         manager.onChange = { [weak self] in
+            self?.manager.saveHistory()
             self?.content.reload()
             self?.sidebar.reload()
             self?.statusBar.refresh()
         }
 
-        // README/screenshot helpers: `--demo` and `--snapshot out.png`
-        Snapshotter.runIfNeeded(window: window, manager: manager)
+        // README/screenshot helpers: `--demo`, `--video-panel`, `--snapshot out.png`
+        Snapshotter.runIfNeeded(window: window, manager: manager, videoPanel: videoPanelController)
+    }
+
+    private func makeMenu() {
+        let main = NSMenu()
+        let application = NSMenu(); let appItem = NSMenuItem(); appItem.submenu = application; main.addItem(appItem)
+        let settings = NSMenuItem(title: "Settings…", action: #selector(DownloadsContentController.settings), keyEquivalent: ",")
+        settings.target = content; application.addItem(settings)
+        application.addItem(.separator())
+        application.addItem(withTitle: "Quit MacDM", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+        let downloads = NSMenu(); let downloadsItem = NSMenuItem(title: "Downloads", action: nil, keyEquivalent: ""); downloadsItem.submenu = downloads; main.addItem(downloadsItem)
+        for (title, action, key) in [("Add Multiple Links…", #selector(DownloadsContentController.batch), "d"),
+                                     ("Video Options / Playlist…", #selector(DownloadsContentController.media), ""),
+                                     ("Pause All", #selector(DownloadsContentController.pauseAll), ""),
+                                     ("Resume All", #selector(DownloadsContentController.resumeAll), "")] {
+            let item = NSMenuItem(title: title, action: action, keyEquivalent: key); item.target = content; downloads.addItem(item)
+        }
+        let edit = NSMenu(title: "Edit"), editItem = NSMenuItem(title: "Edit", action: nil, keyEquivalent: "")
+        editItem.submenu = edit; main.addItem(editItem)
+        for (title, action, key) in [("Cut", "cut:", "x"), ("Copy", "copy:", "c"), ("Paste", "paste:", "v"), ("Select All", "selectAll:", "a")] {
+            edit.addItem(withTitle: title, action: Selector(action), keyEquivalent: key)
+        }
+        NSApp.mainMenu = main
     }
 
     private func makeToolbar() -> NSToolbar {
         let toolbar = NSToolbar()
-        toolbar.delegate = ToolbarDelegate(addAction: { [weak self] in
-            guard let w = self?.window else { return }
-            self?.addPanelController.present(on: w)
-        })
+        toolbarDelegate = ToolbarDelegate(
+            addAction: { [weak self] in
+                guard let w = self?.window else { return }
+                self?.addPanelController.present(on: w)
+            },
+            videoAction: { [weak self] in
+                guard let w = self?.window else { return }
+                self?.videoPanelController.present(on: w)
+            })
+        toolbar.delegate = toolbarDelegate
         toolbar.displayMode = .iconOnly
         toolbar.insertItem(withItemIdentifier: .init("add"), at: 0)
+        toolbar.insertItem(withItemIdentifier: .init("video"), at: 1)
         return toolbar
+    }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        historyTimer?.invalidate()
+        manager.pauseAll()
+        manager.saveHistory()
+        DownloadServices.shared.updateSleep(active: false)
+        ExtensionServer.shared.stop()
     }
 
     func applicationSupportsSecureRestorableState(_ app: NSApplication) -> Bool { true }
 }
 
-/// Toolbar with a prominent Add Download button.
+/// Toolbar with the Add Download and Add Video buttons.
 @MainActor
 final class ToolbarDelegate: NSObject, NSToolbarDelegate {
     let addAction: () -> Void
+    let videoAction: () -> Void
     private var keeper: AddButtonController?
+    private var videoKeeper: AddButtonController?
 
-    init(addAction: @escaping () -> Void) { self.addAction = addAction }
-
-    func toolbar(_ toolbar: NSToolbar, itemForItemIdentifier id: NSToolbarItem.Identifier, willBeInsertedIntoToolbar flag: Bool) -> NSToolbarItem? {
-        guard id.rawValue == "add" else { return nil }
-        let item = NSToolbarItem(itemIdentifier: id)
-        item.label = "Add Download"
-        item.paletteLabel = "Add Download"
-        let ctrl = AddButtonController(action: addAction)
-        keeper = ctrl
-        item.view = ctrl.makeButton()
-        return item
+    init(addAction: @escaping () -> Void, videoAction: @escaping () -> Void) {
+        self.addAction = addAction
+        self.videoAction = videoAction
     }
 
-    func toolbarAllowedItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] { [.init("add")] }
-    func toolbarDefaultItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] { [.init("add")] }
+    func toolbar(_ toolbar: NSToolbar, itemForItemIdentifier id: NSToolbarItem.Identifier, willBeInsertedIntoToolbar flag: Bool) -> NSToolbarItem? {
+        switch id.rawValue {
+        case "add":
+            let item = NSToolbarItem(itemIdentifier: id)
+            item.label = "Add Download"
+            item.paletteLabel = "Add Download"
+            let ctrl = AddButtonController(action: addAction, title: " Add Download", symbol: "plus")
+            keeper = ctrl
+            item.view = ctrl.makeButton()
+            return item
+        case "video":
+            let item = NSToolbarItem(itemIdentifier: id)
+            item.label = "Add Video"
+            item.paletteLabel = "Add Video"
+            let ctrl = AddButtonController(action: videoAction, title: " Add Video", symbol: "video")
+            videoKeeper = ctrl
+            item.view = ctrl.makeButton()
+            return item
+        default:
+            return nil
+        }
+    }
+
+    func toolbarAllowedItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] { [.init("add"), .init("video")] }
+    func toolbarDefaultItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] { [.init("add"), .init("video")] }
 }
 
-/// Retains the Add button and fires its action.
+/// Retains a toolbar button and fires its action.
 @MainActor
 final class AddButtonController {
     let action: () -> Void
-    init(action: @escaping () -> Void) { self.action = action }
+    let title: String
+    let symbol: String
+    init(action: @escaping () -> Void, title: String = " Add Download", symbol: String = "plus") {
+        self.action = action
+        self.title = title
+        self.symbol = symbol
+    }
 
     func makeButton() -> NSButton {
-        let button = NSButton(title: " Add Download", target: self, action: #selector(fire))
+        let button = NSButton(title: title, target: self, action: #selector(fire))
         button.bezelStyle = .texturedRounded
-        button.image = NSImage(systemSymbolName: "plus", accessibilityDescription: "Add")
+        button.image = NSImage(systemSymbolName: symbol, accessibilityDescription: title)
         button.imagePosition = .imageLeading
         button.font = .systemFont(ofSize: 13, weight: .semibold)
         button.controlSize = .large
